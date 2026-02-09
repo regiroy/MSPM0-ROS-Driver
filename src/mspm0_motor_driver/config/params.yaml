@@ -1,0 +1,15 @@
+mspm0_motor_driver:
+  ros__parameters:
+    port: /dev/ttyUSB0
+    baudrate: 115200
+
+    # Robot geometry
+    wheel_radius: 0.0335        # meters (67mm / 2)
+    wheel_base: 0.18            # meters
+
+    # Encoder config
+    encoder_ticks_per_rev: 330  # 11 hall lines * 30 reduction
+
+    # Speed scaling
+    speed_scale: 500.0
+    max_speed: 1000

@@ -8,8 +8,10 @@ setup(
     packages=find_packages(exclude=['test']),
     data_files=[
         ('share/ament_index/resource_index/packages',
-            ['resource/' + package_name]),
-        ('share/' + package_name, ['package.xml']),
+            ['resource/mspm0_motor_driver']),
+        ('share/mspm0_motor_driver', ['package.xml']),
+        ('share/mspm0_motor_driver/launch', ['launch/motor.launch.py']),
+        ('share/mspm0_motor_driver/config', ['config/params.yaml']),
     ],
     install_requires=['setuptools'],
     zip_safe=True,
