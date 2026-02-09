@@ -8,7 +8,8 @@ from nav_msgs.msg import Odometry
 from geometry_msgs.msg import Quaternion
 from geometry_msgs.msg import TransformStamped
 import tf2_ros
-
+from diagnostic_updater import Updater, DiagnosticStatusWrapper
+from diagnostic_msgs.msg import DiagnosticStatus
 
 
 class MSPM0MotorDriver(Node):
@@ -40,6 +41,16 @@ class MSPM0MotorDriver(Node):
             timeout=0.1
         )
 
+        self.updater = Updater(self)
+        self.updater.setHardwareID('mspm0_motor_driver')
+
+        self.battery_voltage = None
+        self.serial_ok = True
+        self.last_serial_rx_time = self.get_clock().now()
+
+        self.updater.add('Motor Driver Status', self.diag_driver_status)
+        self.updater.add('Battery Voltage', self.diag_battery)
+
         time.sleep(2.0)  # allow board reset
 
         self.send_cmd('$read_flash#')
@@ -47,7 +58,9 @@ class MSPM0MotorDriver(Node):
         # Delay encoder upload until startup finishes
         self.create_timer(1.0, self.enable_encoder_upload)
         self.create_timer(0.02, self.update_odometry)  # 50 Hz
-
+        self.create_timer(1.0, self.updater.update)
+        self.create_timer(5.0, self.request_voltage)
+        
         # cmd_vel subscription
         self.cmd_sub = self.create_subscription(
             Twist,
@@ -74,8 +87,9 @@ class MSPM0MotorDriver(Node):
         self.last_cmd_time = self.get_clock().now()
 
         self.watchdog = self.create_timer(0.2, self.check_timeout)
-
         self.timer = self.create_timer(0.1, self.read_serial)
+        # ✅ Battery / voltage polling timer
+        self.create_timer(5.0, lambda: self.send_cmd('$read_vol#'))
 
         # Accumulated encoder pulses since last odom update
         self.accum_left_ticks = 0.0
@@ -88,11 +102,17 @@ class MSPM0MotorDriver(Node):
 
     def read_serial(self):
         while self.ser.in_waiting:
-            line = self.ser.readline().decode(errors='ignore').strip()
+            try:
+                line = self.ser.readline().decode(errors='ignore').strip()
+            except Exception:
+                self.serial_ok = False
+                return
             if not line:
                 return
-
             self.get_logger().info(f'RECV: {line}')
+
+            # ✅ Update last RX time ONLY when we got data
+            self.last_serial_rx_time = self.get_clock().now()
 
             if line.startswith('$MTEP:'):
                 values = self._parse_int_values(line)
@@ -118,6 +138,13 @@ class MSPM0MotorDriver(Node):
                 if values is not None:
                     self.last_mall = values
                     self.get_logger().info(f'MAll total: {values}')
+            elif line.startswith('$Battery:'):
+                try:
+                    self.battery_voltage = float(
+                        line.replace('$Battery:', '').replace('V#', '')
+                    )
+                except Exception:
+                    pass
 
 
     def _parse_int_values(self, line):
@@ -271,6 +298,41 @@ class MSPM0MotorDriver(Node):
 
         self.tf_broadcaster.sendTransform(t)
 
+
+    def diag_driver_status(self, stat):
+        if not self.serial_ok:
+            stat.summary(DiagnosticStatus.ERROR, 'Serial connection lost')
+        else:
+            dt = (self.get_clock().now() - self.last_serial_rx_time).nanoseconds
+            if dt > 2e9:
+                stat.summary(DiagnosticStatus.WARN, 'No serial data received')
+            else:
+                stat.summary(DiagnosticStatus.OK, 'Driver OK')
+
+        stat.add('Serial OK', str(self.serial_ok))  # ✅ string
+        return stat
+
+
+
+    def diag_battery(self, stat):
+        if self.battery_voltage is None:
+            stat.summary(DiagnosticStatus.WARN, 'Battery voltage unknown')
+            stat.add('Voltage (V)', 'unknown')
+            return stat
+
+        if self.battery_voltage < 6.8:
+            stat.summary(DiagnosticStatus.ERROR, 'Battery critically low')
+        elif self.battery_voltage < 7.2:
+            stat.summary(DiagnosticStatus.WARN, 'Battery low')
+        else:
+            stat.summary(DiagnosticStatus.OK, 'Battery OK')
+
+        stat.add('Voltage (V)', f'{self.battery_voltage:.2f}')  # ✅ string
+        return stat
+
+    def request_voltage(self):
+        if self.serial_ok:
+            self.send_cmd('$read_vol#')
 
 def main():
     rclpy.init()
