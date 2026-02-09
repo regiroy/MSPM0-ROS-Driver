@@ -6,6 +6,9 @@ from geometry_msgs.msg import Twist
 import math
 from nav_msgs.msg import Odometry
 from geometry_msgs.msg import Quaternion
+from geometry_msgs.msg import TransformStamped
+import tf2_ros
+
 
 
 class MSPM0MotorDriver(Node):
@@ -21,7 +24,10 @@ class MSPM0MotorDriver(Node):
         # Robot parameters
         self.declare_parameter('speed_scale', 500.0) # ROS m/s → MSPM0 units
         self.declare_parameter('max_speed', 1000)
-
+        # TF parameters
+        self.declare_parameter('publish_tf', True)
+        self.declare_parameter('odom_frame', 'odom')
+        self.declare_parameter('base_frame', 'base_link')
 
         port = self.get_parameter('port').value
         baud = self.get_parameter('baudrate').value
@@ -50,6 +56,8 @@ class MSPM0MotorDriver(Node):
             10
         )
 
+        self.tf_broadcaster = tf2_ros.TransformBroadcaster(self)
+
         self.last_mtep = None
         self.last_mspd = None
         self.last_mall = None
@@ -61,12 +69,18 @@ class MSPM0MotorDriver(Node):
 
         self.last_time = self.get_clock().now()
         self.odom_pub = self.create_publisher(Odometry, '/odom', 10)
+        self.is_stopped = True
 
         self.last_cmd_time = self.get_clock().now()
 
         self.watchdog = self.create_timer(0.2, self.check_timeout)
 
         self.timer = self.create_timer(0.1, self.read_serial)
+
+        # Accumulated encoder pulses since last odom update
+        self.accum_left_ticks = 0.0
+        self.accum_right_ticks = 0.0
+
 
     def send_cmd(self, cmd: str):
         self.get_logger().info(f'SEND: {cmd.strip()}')
@@ -84,7 +98,14 @@ class MSPM0MotorDriver(Node):
                 values = self._parse_int_values(line)
                 if values is not None:
                     self.last_mtep = values
-                    self.get_logger().info(f'MTEP pulses: {values}')
+
+                    # Average front + rear per side
+                    left = (values[0] + values[1]) / 2.0
+                    right = (values[2] + values[3]) / 2.0
+
+                    self.accum_left_ticks += left
+                    self.accum_right_ticks += right
+
 
             elif line.startswith('$MSPD:'):
                 values = self._parse_float_values(line)
@@ -136,12 +157,14 @@ class MSPM0MotorDriver(Node):
         v_left = v - (w * wheel_base / 2.0)
         v_right = v + (w * wheel_base / 2.0)
 
-        # Scale and clamp
         left_cmd = int(max(-max_speed, min(max_speed, v_left * scale)))
         right_cmd = int(max(-max_speed, min(max_speed, v_right * scale)))
 
         cmd = f"$spd:{left_cmd},{left_cmd},{right_cmd},{right_cmd}#"
         self.send_cmd(cmd)
+
+        # IMPORTANT: mark robot as active again
+        self.is_stopped = False
 
 
     def destroy_node(self):
@@ -155,8 +178,13 @@ class MSPM0MotorDriver(Node):
 
     def check_timeout(self):
         dt = (self.get_clock().now() - self.last_cmd_time).nanoseconds
+
         if dt > 500_000_000:  # 0.5 seconds
-            self.send_cmd('$spd:0,0,0,0#')
+            if not self.is_stopped:
+                self.get_logger().warn('cmd_vel timeout — stopping motors')
+                self.send_cmd('$spd:0,0,0,0#')
+                self.is_stopped = True
+
 
     def enable_encoder_upload(self):
         self.get_logger().info('Enabling encoder upload')
@@ -183,16 +211,19 @@ class MSPM0MotorDriver(Node):
         wheel_base = self.get_parameter('wheel_base').value
         ticks_per_rev = self.get_parameter('encoder_ticks_per_rev').value
 
-        # Pulses per 10 ms → pulses per second
-        pulses_left = (self.last_mtep[0] + self.last_mtep[1]) / 2.0
-        pulses_right = (self.last_mtep[2] + self.last_mtep[3]) / 2.0
+        # Consume accumulated encoder pulses
+        left_ticks = self.accum_left_ticks
+        right_ticks = self.accum_right_ticks
 
-        pulses_left *= 100.0
-        pulses_right *= 100.0
+        # Reset accumulators
+        self.accum_left_ticks = 0.0
+        self.accum_right_ticks = 0.0
+
 
         # Convert pulses → meters
-        dist_left = (pulses_left / ticks_per_rev) * (2 * math.pi * wheel_radius) * dt
-        dist_right = (pulses_right / ticks_per_rev) * (2 * math.pi * wheel_radius) * dt
+        dist_left = (left_ticks / ticks_per_rev) * (2 * math.pi * wheel_radius)
+        dist_right = (right_ticks / ticks_per_rev) * (2 * math.pi * wheel_radius)
+
 
         dist = (dist_left + dist_right) / 2.0
         dtheta = (dist_right - dist_left) / wheel_base
@@ -204,6 +235,8 @@ class MSPM0MotorDriver(Node):
 
         self.publish_odometry(dist / dt if dt > 0 else 0.0,
                               dtheta / dt if dt > 0 else 0.0)
+        self.publish_tf()
+
 
     def publish_odometry(self, linear_vel, angular_vel):
         msg = Odometry()
@@ -219,6 +252,24 @@ class MSPM0MotorDriver(Node):
         msg.twist.twist.angular.z = angular_vel
 
         self.odom_pub.publish(msg)
+
+    def publish_tf(self):
+        if not self.get_parameter('publish_tf').value:
+            return
+
+        t = TransformStamped()
+        t.header.stamp = self.get_clock().now().to_msg()
+        t.header.frame_id = self.get_parameter('odom_frame').value
+        t.child_frame_id = self.get_parameter('base_frame').value
+
+        t.transform.translation.x = self.x
+        t.transform.translation.y = self.y
+        t.transform.translation.z = 0.0
+
+        q = self._yaw_to_quaternion(self.theta)
+        t.transform.rotation = q
+
+        self.tf_broadcaster.sendTransform(t)
 
 
 def main():
