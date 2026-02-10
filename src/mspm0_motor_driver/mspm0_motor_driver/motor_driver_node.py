@@ -83,6 +83,8 @@ class MSPM0MotorDriver(Node):
         self.last_time = self.get_clock().now()
         self.odom_pub = self.create_publisher(Odometry, '/odom', 10)
         self.is_stopped = True
+        self.last_rx_log_time = self.get_clock().now()
+        self.rx_log_period_sec = 1.0  # log at most once per second
 
         self.last_cmd_time = self.get_clock().now()
 
@@ -107,13 +109,21 @@ class MSPM0MotorDriver(Node):
             except Exception:
                 self.serial_ok = False
                 return
+
             if not line:
                 return
-            self.get_logger().info(f'RECV: {line}')
 
-            # ✅ Update last RX time ONLY when we got data
+            # ✅ Mark serial as alive
+            self.serial_ok = True
             self.last_serial_rx_time = self.get_clock().now()
 
+            # ✅ Throttled DEBUG logging (once per second max)
+            now = self.get_clock().now()
+            if (now - self.last_rx_log_time).nanoseconds > self.rx_log_period_sec * 1e9:
+                self.get_logger().debug(f'RECV: {line}')
+                self.last_rx_log_time = now
+
+            # ---------- Parse messages ----------
             if line.startswith('$MTEP:'):
                 values = self._parse_int_values(line)
                 if values is not None:
@@ -126,25 +136,29 @@ class MSPM0MotorDriver(Node):
                     self.accum_left_ticks += left
                     self.accum_right_ticks += right
 
-
             elif line.startswith('$MSPD:'):
                 values = self._parse_float_values(line)
                 if values is not None:
                     self.last_mspd = values
-                    self.get_logger().info(f'MSPD speed: {values}')
+                    # 🔇 no INFO spam — data is available via topics
 
             elif line.startswith('$MAll:'):
                 values = self._parse_int_values(line)
                 if values is not None:
                     self.last_mall = values
-                    self.get_logger().info(f'MAll total: {values}')
+                    # 🔇 no INFO spam
+
             elif line.startswith('$Battery:'):
                 try:
                     self.battery_voltage = float(
                         line.replace('$Battery:', '').replace('V#', '')
                     )
                 except Exception:
-                    pass
+                    self.get_logger().warn(f'Battery parse failed: {line}')
+
+            else:
+                # Optional: warn on unknown packets
+                self.get_logger().warn(f'Unknown serial message: {line}')
 
 
     def _parse_int_values(self, line):
@@ -216,6 +230,7 @@ class MSPM0MotorDriver(Node):
     def enable_encoder_upload(self):
         self.get_logger().info('Enabling encoder upload')
         self.send_cmd('$upload:1,1,1#')
+        self.encoder_timer.cancel()
 
     def _yaw_to_quaternion(self, yaw):
         q = Quaternion()
