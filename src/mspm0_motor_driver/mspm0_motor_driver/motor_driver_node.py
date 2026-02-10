@@ -16,16 +16,17 @@ class MSPM0MotorDriver(Node):
     def __init__(self):
         super().__init__('mspm0_motor_driver')
 
+        # ---------------- Parameters ----------------
         self.declare_parameter('port', '/dev/ttyUSB0')
         self.declare_parameter('baudrate', 115200)
-        # Odometry parameters
-        self.declare_parameter('wheel_radius', 0.0335)   # meters (67mm / 2)
+
+        self.declare_parameter('wheel_radius', 0.0335)   # meters
         self.declare_parameter('wheel_base', 0.18)       # meters
-        self.declare_parameter('encoder_ticks_per_rev', 11 * 30)  # hall lines * reduction
-        # Robot parameters
-        self.declare_parameter('speed_scale', 500.0) # ROS m/s → MSPM0 units
+        self.declare_parameter('encoder_ticks_per_rev', 11 * 30)
+
+        self.declare_parameter('speed_scale', 500.0)
         self.declare_parameter('max_speed', 1000)
-        # TF parameters
+
         self.declare_parameter('publish_tf', True)
         self.declare_parameter('odom_frame', 'odom')
         self.declare_parameter('base_frame', 'base_link')
@@ -41,27 +42,30 @@ class MSPM0MotorDriver(Node):
             timeout=0.1
         )
 
+        # ---------------- Diagnostics ----------------
         self.updater = Updater(self)
         self.updater.setHardwareID('mspm0_motor_driver')
 
-        self.battery_voltage = None
         self.serial_ok = True
         self.last_serial_rx_time = self.get_clock().now()
+        self.battery_voltage = None
 
         self.updater.add('Motor Driver Status', self.diag_driver_status)
         self.updater.add('Battery Voltage', self.diag_battery)
 
-        time.sleep(2.0)  # allow board reset
-
+        # ---------------- Startup ----------------
+        time.sleep(2.0)
         self.send_cmd('$read_flash#')
 
-        # Delay encoder upload until startup finishes
+        # ---------------- Timers ----------------
+        self.create_timer(0.02, self.update_odometry)     # 50 Hz
+        self.create_timer(0.1, self.read_serial)           # Serial RX
+        self.create_timer(0.2, self.check_timeout)         # Watchdog
         self.create_timer(1.0, self.enable_encoder_upload)
-        self.create_timer(0.02, self.update_odometry)  # 50 Hz
         self.create_timer(1.0, self.updater.update)
-        self.create_timer(5.0, self.request_voltage)
-        
-        # cmd_vel subscription
+        self.create_timer(5.0, self.request_voltage)       # ✅ single voltage poll
+
+        # ---------------- ROS Interfaces ----------------
         self.cmd_sub = self.create_subscription(
             Twist,
             '/cmd_vel',
@@ -69,33 +73,24 @@ class MSPM0MotorDriver(Node):
             10
         )
 
+        self.odom_pub = self.create_publisher(Odometry, '/odom', 10)
         self.tf_broadcaster = tf2_ros.TransformBroadcaster(self)
 
-        self.last_mtep = None
-        self.last_mspd = None
-        self.last_mall = None
-
-        # Odometry state
+        # ---------------- Odometry State ----------------
         self.x = 0.0
         self.y = 0.0
         self.theta = 0.0
-
         self.last_time = self.get_clock().now()
-        self.odom_pub = self.create_publisher(Odometry, '/odom', 10)
-        self.is_stopped = True
-        self.last_rx_log_time = self.get_clock().now()
-        self.rx_log_period_sec = 1.0  # log at most once per second
 
-        self.last_cmd_time = self.get_clock().now()
-
-        self.watchdog = self.create_timer(0.2, self.check_timeout)
-        self.timer = self.create_timer(0.1, self.read_serial)
-        # ✅ Battery / voltage polling timer
-        self.create_timer(5.0, lambda: self.send_cmd('$read_vol#'))
-
-        # Accumulated encoder pulses since last odom update
         self.accum_left_ticks = 0.0
         self.accum_right_ticks = 0.0
+
+        # ---------------- Logging Throttle ----------------
+        self.last_rx_log_time = self.get_clock().now()
+        self.rx_log_period_sec = 1.0
+
+        self.last_cmd_time = self.get_clock().now()
+        self.is_stopped = True
 
 
     def send_cmd(self, cmd: str):
@@ -113,11 +108,11 @@ class MSPM0MotorDriver(Node):
             if not line:
                 return
 
-            # ✅ Mark serial as alive
+            # Mark serial alive
             self.serial_ok = True
             self.last_serial_rx_time = self.get_clock().now()
 
-            # ✅ Throttled DEBUG logging (once per second max)
+            # Throttled RX debug log
             now = self.get_clock().now()
             if (now - self.last_rx_log_time).nanoseconds > self.rx_log_period_sec * 1e9:
                 self.get_logger().debug(f'RECV: {line}')
@@ -127,12 +122,8 @@ class MSPM0MotorDriver(Node):
             if line.startswith('$MTEP:'):
                 values = self._parse_int_values(line)
                 if values is not None:
-                    self.last_mtep = values
-
-                    # Average front + rear per side
                     left = (values[0] + values[1]) / 2.0
                     right = (values[2] + values[3]) / 2.0
-
                     self.accum_left_ticks += left
                     self.accum_right_ticks += right
 
@@ -140,13 +131,11 @@ class MSPM0MotorDriver(Node):
                 values = self._parse_float_values(line)
                 if values is not None:
                     self.last_mspd = values
-                    # 🔇 no INFO spam — data is available via topics
 
             elif line.startswith('$MAll:'):
                 values = self._parse_int_values(line)
                 if values is not None:
                     self.last_mall = values
-                    # 🔇 no INFO spam
 
             elif line.startswith('$Battery:'):
                 try:
@@ -157,8 +146,8 @@ class MSPM0MotorDriver(Node):
                     self.get_logger().warn(f'Battery parse failed: {line}')
 
             else:
-                # Optional: warn on unknown packets
-                self.get_logger().warn(f'Unknown serial message: {line}')
+                # Expected during boot / flash read
+                self.get_logger().debug(f'Ignoring serial message: {line}')
 
 
     def _parse_int_values(self, line):
@@ -314,36 +303,33 @@ class MSPM0MotorDriver(Node):
         self.tf_broadcaster.sendTransform(t)
 
 
-    def diag_driver_status(self, stat):
+    def diag_driver_status(self, stat: DiagnosticStatusWrapper):
+        stat.summary(stat.OK, 'OK')
+
         if not self.serial_ok:
-            stat.summary(DiagnosticStatus.ERROR, 'Serial connection lost')
-        else:
-            dt = (self.get_clock().now() - self.last_serial_rx_time).nanoseconds
-            if dt > 2e9:
-                stat.summary(DiagnosticStatus.WARN, 'No serial data received')
-            else:
-                stat.summary(DiagnosticStatus.OK, 'Driver OK')
+            stat.summary(stat.ERROR, 'Serial connection lost')
 
-        stat.add('Serial OK', str(self.serial_ok))  # ✅ string
-        return stat
+        dt = (self.get_clock().now() - self.last_serial_rx_time).nanoseconds
+        if dt > 2e9:
+            stat.summary(stat.WARN, 'No serial data received')
+
+        stat.add('Serial OK', self.serial_ok)
 
 
-
-    def diag_battery(self, stat):
+    def diag_battery(self, stat: DiagnosticStatusWrapper):
         if self.battery_voltage is None:
-            stat.summary(DiagnosticStatus.WARN, 'Battery voltage unknown')
-            stat.add('Voltage (V)', 'unknown')
-            return stat
+            stat.summary(stat.WARN, 'Battery voltage unknown')
+            return
 
         if self.battery_voltage < 6.8:
-            stat.summary(DiagnosticStatus.ERROR, 'Battery critically low')
+            stat.summary(stat.ERROR, 'Battery critically low')
         elif self.battery_voltage < 7.2:
-            stat.summary(DiagnosticStatus.WARN, 'Battery low')
+            stat.summary(stat.WARN, 'Battery low')
         else:
-            stat.summary(DiagnosticStatus.OK, 'Battery OK')
+            stat.summary(stat.OK, 'Battery OK')
 
-        stat.add('Voltage (V)', f'{self.battery_voltage:.2f}')  # ✅ string
-        return stat
+        stat.add('Voltage (V)', self.battery_voltage)
+
 
     def request_voltage(self):
         if self.serial_ok:
