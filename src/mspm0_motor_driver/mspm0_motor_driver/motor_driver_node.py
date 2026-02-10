@@ -57,11 +57,16 @@ class MSPM0MotorDriver(Node):
         time.sleep(2.0)
         self.send_cmd('$read_flash#')
 
+        # ---- Serial state ----
+        self.last_mtep = None
+        self.last_mspd = None
+        self.last_mall = None
+
         # ---------------- Timers ----------------
         self.create_timer(0.02, self.update_odometry)     # 50 Hz
         self.create_timer(0.1, self.read_serial)           # Serial RX
         self.create_timer(0.2, self.check_timeout)         # Watchdog
-        self.create_timer(1.0, self.enable_encoder_upload)
+        self.encoder_timer = self.create_timer(1.0, self.enable_encoder_upload)
         self.create_timer(1.0, self.updater.update)
         self.create_timer(5.0, self.request_voltage)       # ✅ single voltage poll
 
@@ -81,7 +86,19 @@ class MSPM0MotorDriver(Node):
         self.y = 0.0
         self.theta = 0.0
         self.last_time = self.get_clock().now()
+        self.odom_pub = self.create_publisher(Odometry, '/odom', 10)
+        self.is_stopped = True
+        self.last_rx_log_time = self.get_clock().now()
+        self.rx_log_period_sec = 1.0  # log at most once per second
 
+        self.last_cmd_time = self.get_clock().now()
+
+        self.watchdog = self.create_timer(0.2, self.check_timeout)
+        self.timer = self.create_timer(0.1, self.read_serial)
+        # ✅ Battery / voltage polling timer
+        self.create_timer(5.0, lambda: self.send_cmd('$read_vol#'))
+
+        # Accumulated encoder pulses since last odom update
         self.accum_left_ticks = 0.0
         self.accum_right_ticks = 0.0
 
@@ -122,6 +139,9 @@ class MSPM0MotorDriver(Node):
             if line.startswith('$MTEP:'):
                 values = self._parse_int_values(line)
                 if values is not None:
+                    self.last_mtep = values
+
+                    # Average front + rear per side
                     left = (values[0] + values[1]) / 2.0
                     right = (values[2] + values[3]) / 2.0
                     self.accum_left_ticks += left
@@ -313,13 +333,16 @@ class MSPM0MotorDriver(Node):
         if dt > 2e9:
             stat.summary(stat.WARN, 'No serial data received')
 
-        stat.add('Serial OK', self.serial_ok)
+        stat.add('Serial OK', str(self.serial_ok))
+        stat.add('Last RX age (s)', f'{dt / 1e9:.2f}')
 
+        return stat
 
     def diag_battery(self, stat: DiagnosticStatusWrapper):
         if self.battery_voltage is None:
             stat.summary(stat.WARN, 'Battery voltage unknown')
-            return
+            stat.add('Voltage (V)', 'unknown')
+            return stat
 
         if self.battery_voltage < 6.8:
             stat.summary(stat.ERROR, 'Battery critically low')
@@ -328,7 +351,8 @@ class MSPM0MotorDriver(Node):
         else:
             stat.summary(stat.OK, 'Battery OK')
 
-        stat.add('Voltage (V)', self.battery_voltage)
+        stat.add('Voltage (V)', f'{self.battery_voltage:.2f}')
+        return stat
 
 
     def request_voltage(self):
