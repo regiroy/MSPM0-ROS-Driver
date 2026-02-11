@@ -56,7 +56,7 @@ class MSPM0MotorDriver(Node):
         # ---------------- Startup ----------------
         time.sleep(2.0)
         self.send_cmd('$read_flash#')
-
+        self.last_cmd_time = self.get_clock().now()
         # ---- Serial state ----
         self.last_mtep = None
         self.last_mspd = None
@@ -86,28 +86,13 @@ class MSPM0MotorDriver(Node):
         self.y = 0.0
         self.theta = 0.0
         self.last_time = self.get_clock().now()
-        self.odom_pub = self.create_publisher(Odometry, '/odom', 10)
         self.is_stopped = True
         self.last_rx_log_time = self.get_clock().now()
         self.rx_log_period_sec = 1.0  # log at most once per second
 
-        self.last_cmd_time = self.get_clock().now()
-
-        self.watchdog = self.create_timer(0.2, self.check_timeout)
-        self.timer = self.create_timer(0.1, self.read_serial)
-        # ✅ Battery / voltage polling timer
-        self.create_timer(5.0, lambda: self.send_cmd('$read_vol#'))
-
         # Accumulated encoder pulses since last odom update
         self.accum_left_ticks = 0.0
         self.accum_right_ticks = 0.0
-
-        # ---------------- Logging Throttle ----------------
-        self.last_rx_log_time = self.get_clock().now()
-        self.rx_log_period_sec = 1.0
-
-        self.last_cmd_time = self.get_clock().now()
-        self.is_stopped = True
 
 
     def send_cmd(self, cmd: str):
